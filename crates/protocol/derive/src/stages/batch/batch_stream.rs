@@ -1,8 +1,8 @@
 //! This module contains the `BatchStream` stage.
 
 use crate::{
-    L2ChainProvider, NextBatchProvider, OriginAdvancer, OriginProvider, PipelineEncodingError,
-    PipelineError, PipelineResult, Signal, SignalReceiver,
+    L2ChainProvider, NextBatchProvider, OriginAdvancer, OriginProvider, PipelineError,
+    PipelineResult, Signal, SignalReceiver,
 };
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc};
 use async_trait::async_trait;
@@ -10,6 +10,7 @@ use core::fmt::Debug;
 use kona_genesis::RollupConfig;
 use kona_protocol::{
     Batch, BatchValidity, BatchWithInclusionBlock, BlockInfo, L2BlockInfo, SingleBatch, SpanBatch,
+    SpanBatchError,
 };
 
 /// Provides [`Batch`]es for the [`BatchStream`] stage.
@@ -72,11 +73,11 @@ where
         &mut self,
         parent: L2BlockInfo,
         l1_origins: &[BlockInfo],
-    ) -> PipelineResult<SingleBatch> {
+    ) -> Result<Option<SingleBatch>, SpanBatchError> {
         trace!(target: "batch_span", "Attempting to get a SingleBatch from buffer len: {}", self.buffer.len());
 
         self.try_hydrate_buffer(parent, l1_origins)?;
-        self.buffer.pop_front().ok_or_else(|| PipelineError::NotEnoughData.temp())
+        Ok(self.buffer.pop_front())
     }
 
     /// Hydrates the buffer with single batches derived from the span batch, if there is one
@@ -85,13 +86,9 @@ where
         &mut self,
         parent: L2BlockInfo,
         l1_origins: &[BlockInfo],
-    ) -> PipelineResult<()> {
+    ) -> Result<(), SpanBatchError> {
         if let Some(span) = self.span.take() {
-            self.buffer.extend(
-                span.get_singular_batches(l1_origins, parent).map_err(|e| {
-                    PipelineError::BadEncoding(PipelineEncodingError::from(e)).crit()
-                })?,
-            );
+            self.buffer.extend(span.get_singular_batches(l1_origins, parent)?);
         }
         let batch_count = self.buffer.len() as f64;
         kona_macros::set!(gauge, crate::metrics::Metrics::PIPELINE_BATCH_BUFFER, batch_count);
@@ -194,7 +191,17 @@ where
         }
 
         // Attempt to pull a SingleBatch out of the SpanBatch.
-        self.get_single_batch(parent, l1_origins).map(Batch::Single)
+        match self.get_single_batch(parent, l1_origins) {
+            Ok(Some(single_batch)) => Ok(Batch::Single(single_batch)),
+            Ok(None) => Err(PipelineError::NotEnoughData.temp()),
+            Err(e) => {
+                trace!(target: "batch_span", "Extracting singular batches from span batch failed: {}", e);
+                // If singular batch extraction fails, it should be handled the same as a
+                // dropped batch during span batch prefix checks.
+                self.flush();
+                Err(PipelineError::NotEnoughData.temp())
+            }
+        }
     }
 }
 
